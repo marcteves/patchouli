@@ -1,0 +1,482 @@
+A project in CS140. This patch applies a lottery scheduler class to the 
+linux-2.6.34 kernel.
+diff -ur '--exclude-from=diffexclude' --new-file linux-2.6.34-o/arch/x86/include/asm/syscalls.h linux-2.6.34/arch/x86/include/asm/syscalls.h
+--- linux-2.6.34-o/arch/x86/include/asm/syscalls.h	2010-05-17 05:17:36.000000000 +0800
++++ linux-2.6.34/arch/x86/include/asm/syscalls.h	2017-12-20 23:47:29.029978365 +0800
+@@ -64,5 +64,13 @@
+ asmlinkage long sys_mmap(unsigned long, unsigned long, unsigned long,
+ 			 unsigned long, unsigned long, unsigned long);
+ 
++/* kernel/sched.c */
++/* syscalls for the lottery class */
++/* and also the game	*/
++int sys_gettickets(pid_t);
++int sys_settickets(pid_t, int);
++int sys_lotterycount(void);
++int sys_togglelottery(void);
++
+ #endif /* CONFIG_X86_32 */
+ #endif /* _ASM_X86_SYSCALLS_H */
+diff -ur '--exclude-from=diffexclude' --new-file linux-2.6.34-o/arch/x86/include/asm/unistd_32.h linux-2.6.34/arch/x86/include/asm/unistd_32.h
+--- linux-2.6.34-o/arch/x86/include/asm/unistd_32.h	2010-05-17 05:17:36.000000000 +0800
++++ linux-2.6.34/arch/x86/include/asm/unistd_32.h	2017-12-20 19:46:40.731672510 +0800
+@@ -343,10 +343,14 @@
+ #define __NR_rt_tgsigqueueinfo	335
+ #define __NR_perf_event_open	336
+ #define __NR_recvmmsg		337
++#define __NR_gettickets		338
++#define __NR_settickets		339
++#define __NR_lotterycount		340
++#define __NR_togglelottery		341
+ 
+ #ifdef __KERNEL__
+ 
+-#define NR_syscalls 338
++#define NR_syscalls 342
+ 
+ #define __ARCH_WANT_IPC_PARSE_VERSION
+ #define __ARCH_WANT_OLD_READDIR
+diff -ur '--exclude-from=diffexclude' --new-file linux-2.6.34-o/arch/x86/kernel/syscall_table_32.S linux-2.6.34/arch/x86/kernel/syscall_table_32.S
+--- linux-2.6.34-o/arch/x86/kernel/syscall_table_32.S	2010-05-17 05:17:36.000000000 +0800
++++ linux-2.6.34/arch/x86/kernel/syscall_table_32.S	2017-12-20 21:17:44.070788163 +0800
+@@ -337,3 +337,7 @@
+ 	.long sys_rt_tgsigqueueinfo	/* 335 */
+ 	.long sys_perf_event_open
+ 	.long sys_recvmmsg
++	.long sys_gettickets
++	.long sys_settickets
++	.long sys_lotterycount
++	.long sys_togglelottery
+diff -ur '--exclude-from=diffexclude' --new-file linux-2.6.34-o/include/linux/init_task.h linux-2.6.34/include/linux/init_task.h
+--- linux-2.6.34-o/include/linux/init_task.h	2010-05-17 05:17:36.000000000 +0800
++++ linux-2.6.34/include/linux/init_task.h	2017-12-19 14:27:28.471405474 +0800
+@@ -129,6 +129,11 @@
+ 		.time_slice	= HZ, 					\
+ 		.nr_cpus_allowed = NR_CPUS,				\
+ 	},								\
++	.lucky		= {						\
++		.run_list	= LIST_HEAD_INIT(tsk.lucky.run_list),	\
++		.time_slice	= HZ, 					\
++		.tickets	= 10,					\
++	},								\
+ 	.tasks		= LIST_HEAD_INIT(tsk.tasks),			\
+ 	.pushable_tasks = PLIST_NODE_INIT(tsk.pushable_tasks, MAX_PRIO), \
+ 	.ptraced	= LIST_HEAD_INIT(tsk.ptraced),			\
+diff -ur '--exclude-from=diffexclude' --new-file linux-2.6.34-o/include/linux/sched.h linux-2.6.34/include/linux/sched.h
+--- linux-2.6.34-o/include/linux/sched.h	2010-05-17 05:17:36.000000000 +0800
++++ linux-2.6.34/include/linux/sched.h	2017-12-20 20:34:44.931733566 +0800
+@@ -38,6 +38,7 @@
+ #define SCHED_BATCH		3
+ /* SCHED_ISO: reserved but not implemented yet */
+ #define SCHED_IDLE		5
++#define SCHED_LUCKY		6
+ /* Can be ORed in to make sure the process is reverted back to SCHED_NORMAL on fork */
+ #define SCHED_RESET_ON_FORK     0x40000000
+ 
+@@ -1165,6 +1166,12 @@
+ #endif
+ };
+ 
++struct sched_lucky_entity {
++	struct list_head run_list;
++	unsigned int time_slice;
++	int tickets; /* starts at 10 */
++};
++
+ struct rcu_node;
+ 
+ struct task_struct {
+@@ -1187,6 +1194,7 @@
+ 	const struct sched_class *sched_class;
+ 	struct sched_entity se;
+ 	struct sched_rt_entity rt;
++	struct sched_lucky_entity lucky;
+ 
+ #ifdef CONFIG_PREEMPT_NOTIFIERS
+ 	/* list of struct preempt_notifier: */
+diff -ur '--exclude-from=diffexclude' --new-file linux-2.6.34-o/kernel/sched.c linux-2.6.34/kernel/sched.c
+--- linux-2.6.34-o/kernel/sched.c	2010-05-17 05:17:36.000000000 +0800
++++ linux-2.6.34/kernel/sched.c	2017-12-21 14:36:34.971893707 +0800
+@@ -450,6 +450,19 @@
+ #endif
+ };
+ 
++struct lucky_rq {
++	struct list_head tasks;
++	unsigned long nr_running;
++	struct list_head running;
++	int active; /* 0 - inactive, 1 - active */
++
++	/* These are for the RUNNING tasks only, blocked tickets are
++	 * untracked
++	 */
++	int total_tickets;
++};
++
++
+ #ifdef CONFIG_SMP
+ 
+ /*
+@@ -512,6 +525,7 @@
+ 
+ 	struct cfs_rq cfs;
+ 	struct rt_rq rt;
++	struct lucky_rq lucky;
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	/* list of leaf cfs_rq on this cpu: */
+@@ -1930,6 +1944,7 @@
+ }
+ 
+ #include "sched_idletask.c"
++#include "sched_lucky.c"
+ #include "sched_fair.c"
+ #include "sched_rt.c"
+ #ifdef CONFIG_SCHED_DEBUG
+@@ -4475,6 +4490,10 @@
+ 		p->sched_class = &rt_sched_class;
+ 	else
+ 		p->sched_class = &fair_sched_class;
++	//Leave it up to fate
++	if (policy == SCHED_LUCKY)
++		p->sched_class = &lucky_sched_class;
++
+ 	set_load_weight(p);
+ }
+ 
+@@ -4516,7 +4535,7 @@
+ 
+ 		if (policy != SCHED_FIFO && policy != SCHED_RR &&
+ 				policy != SCHED_NORMAL && policy != SCHED_BATCH &&
+-				policy != SCHED_IDLE)
++				policy != SCHED_IDLE && policy != SCHED_LUCKY)
+ 			return -EINVAL;
+ 	}
+ 
+@@ -7621,6 +7640,14 @@
+ #endif
+ }
+ 
++static void init_lucky_rq(struct lucky_rq *lucky_rq, struct rq *rq)
++{
++	INIT_LIST_HEAD(&lucky_rq->tasks);
++	lucky_rq->nr_running = 0;
++	lucky_rq->total_tickets = 0;
++	lucky_rq->active = 1;
++}
++
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ static void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
+ 				struct sched_entity *se, int cpu, int add,
+@@ -7752,6 +7779,7 @@
+ 		rq->calc_load_update = jiffies + LOAD_FREQ;
+ 		init_cfs_rq(&rq->cfs, rq);
+ 		init_rt_rq(&rq->rt, rq);
++		init_lucky_rq(&rq->lucky, rq);
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 		init_task_group.shares = init_task_group_load;
+ 		INIT_LIST_HEAD(&rq->leaf_cfs_rq_list);
+@@ -9206,3 +9234,104 @@
+ EXPORT_SYMBOL_GPL(synchronize_sched_expedited);
+ 
+ #endif /* #else #ifndef CONFIG_SMP */
++
++/**
++ * sys_gettickets - get the tickets for a task
++ * @who: pid of process
++ */
++SYSCALL_DEFINE1(gettickets, pid_t, who)
++{
++	struct task_struct *p;
++	p = find_process_by_pid(who);
++	return p->lucky.tickets;
++}
++
++/**
++ * sys_settickets - set the tickets for a task and return changed amount
++ * @who: pid of process
++ * @which: difference from original tickets
++ *
++ * Note that if this call would have reduced the tickets
++ * to below 0, then the tickets are set back to 1
++ * because 1 is the minimum number of tickets
++ *
++ * Updating the total_tickets is a must
++ */
++SYSCALL_DEFINE2(settickets, pid_t, who, int, which)
++{
++	struct task_struct *p;
++	struct sched_lucky_entity *lucky_se;
++	struct rq *rq;
++	int cpu;
++
++	int old_tickets;
++	int actual_offset;
++
++	p = find_process_by_pid(who);
++	lucky_se = &p->lucky;
++	old_tickets = lucky_se->tickets;
++	lucky_se->tickets = which;
++
++	if (lucky_se->tickets < 1)
++		lucky_se->tickets = 1;
++
++	actual_offset = lucky_se->tickets - old_tickets;
++
++	/* find the lucky rq this task_struct belongs to */
++	preempt_disable();
++	cpu = smp_processor_id();
++	rq = cpu_rq(cpu);
++	preempt_enable_no_resched();
++
++	rq->lucky.total_tickets += actual_offset;
++	return lucky_se->tickets;
++}
++
++/**
++ * sys_lotterycount - return the number of queued tasks for lottery
++ */
++SYSCALL_DEFINE0(lotterycount)
++{
++	struct list_head *head;
++	struct list_head *cursor;
++	struct rq *rq;
++	int cpu;
++	int count;
++
++	preempt_disable();
++	cpu = smp_processor_id();
++	rq = cpu_rq(cpu);
++	preempt_enable_no_resched();
++
++	head = &rq->lucky.tasks;
++
++	count = 0;
++
++	list_for_each(cursor, head){
++		count += 1;
++	}
++
++	return count;
++}
++
++/**
++ * sys_togglelottery - toggle lottery between active or inactive state
++ * returns active state after toggling
++ */
++SYSCALL_DEFINE0(togglelottery)
++{
++	struct rq *rq;
++	int cpu;
++
++	preempt_disable();
++	cpu = smp_processor_id();
++	rq = cpu_rq(cpu);
++	preempt_enable_no_resched();
++
++	if (rq->lucky.active == 0)
++		rq->lucky.active = 1;
++	else
++		rq->lucky.active = 0;
++
++	return rq->lucky.active;
++}
+diff -ur '--exclude-from=diffexclude' --new-file linux-2.6.34-o/kernel/sched_fair.c linux-2.6.34/kernel/sched_fair.c
+--- linux-2.6.34-o/kernel/sched_fair.c	2010-05-17 05:17:36.000000000 +0800
++++ linux-2.6.34/kernel/sched_fair.c	2017-12-20 18:03:27.389541404 +0800
+@@ -3686,7 +3686,7 @@
+  * All the scheduling class methods:
+  */
+ static const struct sched_class fair_sched_class = {
+-	.next			= &idle_sched_class,
++	.next			= &lucky_sched_class,
+ 	.enqueue_task		= enqueue_task_fair,
+ 	.dequeue_task		= dequeue_task_fair,
+ 	.yield_task		= yield_task_fair,
+diff -ur '--exclude-from=diffexclude' --new-file linux-2.6.34-o/kernel/sched_lucky.c linux-2.6.34/kernel/sched_lucky.c
+--- linux-2.6.34-o/kernel/sched_lucky.c	1970-01-01 08:00:00.000000000 +0800
++++ linux-2.6.34/kernel/sched_lucky.c	2017-12-21 15:12:32.187854207 +0800
+@@ -0,0 +1,183 @@
++/*
++ * Lottery type scheduler class mapped to SCHED_LUCKY policies
++ */
++
++#include <linux/sched.h>
++#include <linux/random.h>
++
++static int task_has_lottery_scheduling_policy(struct task_struct *curr)
++{
++	if (curr -> policy == SCHED_LUCKY)
++		return 1;
++	return 0;
++}
++
++static void update_curr_stats_lucky(struct rq *rq)
++{
++	struct task_struct *curr = rq->curr;
++	u64 delta_exec;
++
++	//Implement this
++	if (!task_has_lottery_scheduling_policy(curr))
++		return;
++
++	delta_exec = rq->clock - curr->se.exec_start;
++	if (unlikely((s64)delta_exec < 0))
++		delta_exec = 0;
++
++	schedstat_set(curr->se.exec_max, max(curr->se.exec_max,
++				delta_exec));
++
++	curr->se.sum_exec_runtime += delta_exec;
++	curr->se.exec_start = rq->clock;
++	cpuacct_charge(curr, delta_exec);
++}
++
++static void
++enqueue_task_lucky(struct rq *rq, struct task_struct *p, int wakeup, bool head)
++{
++	/* head flag is ignored, task list is not a queue */
++
++	struct sched_lucky_entity *lucky_se = &p->lucky;
++	struct lucky_rq *lucky_rq = &rq->lucky;
++
++	list_add(&lucky_se->run_list, &lucky_rq->tasks);
++
++	lucky_rq->total_tickets += lucky_se->tickets;
++}
++
++static void dequeue_task_lucky(struct rq *rq, struct task_struct *p, int sleep)
++{
++	struct sched_lucky_entity *lucky_se = &p->lucky;
++	struct lucky_rq *lucky_rq = &rq->lucky;
++
++	update_curr_stats_lucky(rq);
++
++	list_del(&lucky_se->run_list);
++
++	lucky_rq->total_tickets -= lucky_se->tickets;
++}
++
++/*
++ * The heart of the lottery scheduler.
++ * Total tickets for RUNNING tasks are tracked. This is used to
++ * limit the winning number generated.
++ *
++ * Visual represntation of lottery:
++ * Winning number: 5
++ * Task queue: (note that order doesn't matter for prob. to run)
++ * [TTTT] - [TTT] - [TTTTTTTTT]
++ *            ^ "ticket #5"
++ */
++static struct task_struct *pick_next_task_lucky(struct rq *rq)
++{
++	struct sched_lucky_entity *lucky_se;
++	int total_tickets;
++	int winning_number;
++	struct task_struct *p;
++	struct list_head *head;
++
++	total_tickets = rq->lucky.total_tickets;
++
++	/* No tasks here, move on to next sched class */
++	if (rq->lucky.active == 0 || total_tickets  == 0)
++		return NULL;
++
++	winning_number = (int) get_random_int() % total_tickets;
++
++	if (winning_number < 0)
++		winning_number *= -1;
++
++	head = &rq->lucky.tasks;
++	list_for_each_entry(lucky_se, head, run_list){
++		if (winning_number < lucky_se->tickets)
++			break;
++
++		p = container_of(lucky_se, struct task_struct, lucky);
++		winning_number -= lucky_se->tickets;
++	}
++
++	p = container_of(lucky_se, struct task_struct, lucky);
++	return p;
++}
++
++static void task_tick_lucky(struct rq *rq, struct task_struct *curr, int queued)
++{
++	update_curr_stats_lucky(rq);
++
++	/* Continue if task still has time */
++	if (--curr->lucky.time_slice)
++		return;
++
++	/* Otherwise, switch running task */
++	curr->lucky.time_slice = DEF_TIMESLICE; 
++
++	set_tsk_need_resched(curr);
++}
++
++
++static void yield_task_lucky(struct rq *rq)
++{
++	//Do nothing
++}
++
++static void check_preempt_curr_lucky(struct rq *rq, struct task_struct *p, int wake_flags)
++{
++	//Do nothing
++}
++
++static void prio_changed_lucky(struct rq *rq, struct task_struct *p,
++			      int oldprio, int running)
++{
++
++	//Do nothing
++}
++
++static void set_curr_task_lucky(struct rq *rq)
++{
++	struct task_struct *p = rq -> curr;
++	p -> se.exec_start = rq -> clock;
++}
++
++static void put_prev_task_lucky(struct rq *rq, struct task_struct *prev)
++{
++	update_curr_stats_lucky(rq);
++	prev->se.exec_start = 0;
++}
++
++static void switched_to_lucky(struct rq *rq, struct task_struct *p,
++			     int running)
++{
++	if (running) {
++		resched_task(rq->curr);
++	} else {
++		check_preempt_curr(rq, p, 0);
++	}
++}
++
++static unsigned int get_rr_interval_lucky(struct rq *rq, struct task_struct *task)
++{
++	return 0;
++}
++
++
++static const struct sched_class lucky_sched_class = {
++	.next			= &idle_sched_class,
++	.enqueue_task		= enqueue_task_lucky,
++	.dequeue_task		= dequeue_task_lucky,
++	.yield_task		= yield_task_lucky,
++
++	.check_preempt_curr	= check_preempt_curr_lucky,
++
++	.pick_next_task		= pick_next_task_lucky,
++	.put_prev_task		= put_prev_task_lucky,
++
++	.set_curr_task          = set_curr_task_lucky,
++	.task_tick		= task_tick_lucky,
++
++	.get_rr_interval	= get_rr_interval_lucky,
++
++	.prio_changed		= prio_changed_lucky,
++	.switched_to		= switched_to_lucky,
++};
++
